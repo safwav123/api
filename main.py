@@ -1,169 +1,195 @@
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List, Dict, Any, Union
-from pydantic import BaseModel
+import cv2
+import numpy as np
+import mediapipe as mp
 import json
 import uvicorn
-import base64
-from PIL import Image
-import io
-import os
+from typing import Optional
 
-# Create FastAPI app
-app = FastAPI(title="Body Measurements and Abaya Recommendations API")
+app = FastAPI(title="نظام تحديد شكل الجسم")
 
-# Add CORS middleware to allow Flutter app to connect
+# إعدادات CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Define body type recommendations data
+# تعريف توصيات أنواع الجسم
 BODY_TYPE_RECOMMENDATIONS = {
     "hourglass": [
-        {"id": 1, "style": "Fitted", "body_type": "hourglass", "description": "Fitted abayas that accentuate the waist"},
-        {"id": 2, "style": "Belt-Cinched", "body_type": "hourglass", "description": "Styles with belts to highlight the waistline"}
+        {"id": 1, "style": "فساتين مخصصة عند الخصر", "description": "تسليط الضوء على تناسق الخصر مع الصدر والأوراك"},
+        {"id": 2, "style": "أحزمة وسط", "description": "إبراز منطقة الخصر باستخدام أحزمة زينة"}
     ],
     "pear": [
-        {"id": 3, "style": "A-Line", "body_type": "pear", "description": "A-line cuts that flow from the hip"},
-        {"id": 4, "style": "Empire Waist", "body_type": "pear", "description": "Empire waist styles to draw attention upward"}
+        {"id": 3, "style": "تأكيد على الجزء العلوي", "description": "استخدام تفاصيل جذابة في أعلى الجسم"},
+        {"id": 4, "style": "A-line", "description": "تصميم يتسع تدريجياً ليوازن الجزء السفلي"}
     ],
     "inverted_triangle": [
-        {"id": 5, "style": "Flared", "body_type": "inverted_triangle", "description": "Flared bottom abayas to balance shoulders"},
-        {"id": 6, "style": "Layered", "body_type": "inverted_triangle", "description": "Layered styles to add volume to lower body"}
+        {"id": 5, "style": "تصاميم متسعة من الأسفل", "description": "إضافة حجم للجزء السفلي لتحقيق التوازن"},
+        {"id": 6, "style": "تفاصيل أسفل الجسم", "description": "تركيز الزخارف في الجزء السفلي"}
     ],
     "rectangle": [
-        {"id": 7, "style": "Pleated", "body_type": "rectangle", "description": "Pleated styles to create curves"},
-        {"id": 8, "style": "Draped", "body_type": "rectangle", "description": "Draped abayas to add dimension"}
+        {"id": 7, "style": "طبقات وتفاصيل", "description": "خلق إيحاء بالمنحنيات باستخدام طبقات القماش"},
+        {"id": 8, "style": "أحزمة عريضة", "description": "إبراز الخصر باستخدام أحزمة واضحة"}
     ],
     "apple": [
-        {"id": 9, "style": "Empire Line", "body_type": "apple", "description": "Empire line cuts to draw attention away from midsection"},
-        {"id": 10, "style": "Straight Cut", "body_type": "apple", "description": "Straight cuts with flowing fabric"}
+        {"id": 9, "style": "خط الإمبراطورة", "description": "تصميم يبدأ تحت الصدر مباشرة لإطالة المظهر"},
+        {"id": 10, "style": "تفاصيل أعلى الجسم", "description": "جذب الانتباه لأعلى بعيداً عن المنطقة الوسطى"}
     ]
 }
 
-# Root endpoint to check if API is running
-@app.get("/")
-async def root():
-    return {"message": "Body Measurements and Abaya Recommendations API is running"}
+# تهيئة نموذج MediaPipe لتحليل الجسم
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=True,
+    min_detection_confidence=0.7,
+    model_complexity=2
+)
 
-# Process measurements endpoint
-@app.post("/process-measurements")
-async def process_measurements(
-    user_height_cm: float = Form(...),
+def calculate_body_ratios(measurements):
+    """حساب النسب الأساسية لتحديد شكل الجسم"""
+    ratios = {
+        "waist_to_bust": measurements["waist"] / measurements["bust"],
+        "waist_to_hip": measurements["waist"] / measurements["hips"],
+        "shoulder_to_hip": measurements["shoulder_width"] / measurements["hips"]
+    }
+    return ratios
+
+def determine_body_type(measurements):
+    """تحديد نوع الجسم بناء على القياسات والنسب"""
+    ratios = calculate_body_ratios(measurements)
+    
+    # تحليل النسب
+    is_defined_waist = ratios["waist_to_hip"] < 0.8
+    balanced_upper_lower = 0.9 < ratios["shoulder_to_hip"] < 1.1
+    
+    if ratios["waist_to_hip"] < 0.75 and ratios["waist_to_bust"] < 0.75 and balanced_upper_lower:
+        return "hourglass"
+    elif ratios["waist_to_hip"] < 0.8 and ratios["shoulder_to_hip"] < 0.9:
+        return "pear"
+    elif ratios["shoulder_to_hip"] > 1.15 and ratios["waist_to_bust"] < 0.85:
+        return "inverted_triangle"
+    elif ratios["waist_to_bust"] > 0.85 and ratios["waist_to_hip"] > 0.85:
+        return "apple"
+    else:
+        return "rectangle"
+
+def analyze_image_content(image_data, user_height_cm=0):
+    """تحليل الصورة لاستخراج القياسات"""
+    img = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("لا يمكن قراءة الصورة")
+    
+    # تحويل الصورة وتحليلها
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+    
+    if not results.pose_landmarks:
+        raise ValueError("لم يتم اكتشاف وضعية الجسم في الصورة")
+    
+    landmarks = results.pose_landmarks.landmark
+    img_height, img_width = img.shape[:2]
+    
+    # استخراج النقاط الرئيسية
+    def get_coords(landmark):
+        return landmark.x * img_width, landmark.y * img_height
+    
+    # حساب القياسات (بالبكسل)
+    shoulder_width = abs(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x - 
+                        landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x) * img_width
+    bust = shoulder_width * 1.6  # تقدير محيط الصدر
+    waist = abs(landmarks[mp_pose.PoseLandmark.LEFT_HIP].x - 
+               landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x) * img_width * 1.3
+    hips = waist * 1.3  # تقدير محيط الأوراك
+    
+    # التحويل إلى سنتيمترات
+    if user_height_cm > 0:
+        body_height_px = abs(landmarks[mp_pose.PoseLandmark.NOSE].y - 
+                         landmarks[mp_pose.PoseLandmark.LEFT_HEEL].y) * img_height
+        scale = user_height_cm / body_height_px
+    else:
+        scale = 0.0265  # افتراضي إذا لم يتم تقديم الطول
+    
+    measurements = {
+        "shoulder_width": round(shoulder_width * scale, 2),
+        "bust": round(bust * scale, 2),
+        "waist": round(waist * scale, 2),
+        "hips": round(hips * scale, 2),
+        "height": user_height_cm if user_height_cm > 0 else round(body_height_px * scale, 2)
+    }
+    
+    return measurements
+
+@app.post("/analyze-body")
+async def analyze_body(
     image: Optional[UploadFile] = File(None),
-    manual_measurements: Optional[str] = Form(None)
+    manual_measurements: Optional[str] = Form(None),
+    user_height_cm: float = Form(0)
 ):
-    # Check if at least one of image or manual_measurements is provided
-    if image is None and manual_measurements is None:
-        raise HTTPException(status_code=400, detail="Either image or manual_measurements must be provided")
-    
-    # Process image if provided
-    if image:
-        try:
-            # Here you would implement your image processing logic
-            # This is a placeholder for your actual implementation
-            image_content = await image.read()
-            
-            # Placeholder for your image processing algorithm
-            # In a real implementation, you would extract measurements from the image
-            
-            # Return placeholder results - replace with actual processing logic
-            results = [{
-                "measurements": {
-                    "bust": 92.5,
-                    "waist": 73.2,
-                    "hips": 98.8
-                },
-                "body_analysis": {
-                    "type": "hourglass",
-                    "confidence": "high",
-                    "ratios": {
-                        "waist_to_bust": 0.79,
-                        "waist_to_hip": 0.74
-                    }
-                }
-            }]
-            
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-    
-    # Process manual measurements if provided
-    elif manual_measurements:
-        try:
-            # Parse the manual measurements JSON
-            measurements_dict = json.loads(manual_measurements)
-            
-            # Determine body type based on measurements
-            # This is a placeholder - implement your actual logic
-            # For example:
-            bust = measurements_dict.get("bust", 0)
-            waist = measurements_dict.get("waist", 0)
-            hips = measurements_dict.get("hips", 0)
-            
-            # Simple ratio-based body type determination
-            body_type = "rectangle"  # default
-            waist_to_bust_ratio = waist / bust if bust else 0
-            waist_to_hip_ratio = waist / hips if hips else 0
-            
-            if waist_to_bust_ratio < 0.8 and waist_to_hip_ratio < 0.8:
-                body_type = "hourglass"
-            elif waist_to_bust_ratio > 0.8 and waist_to_hip_ratio < 0.8:
-                body_type = "pear"
-            elif waist_to_bust_ratio < 0.8 and waist_to_hip_ratio > 0.8:
-                body_type = "inverted_triangle"
-            elif waist_to_bust_ratio > 0.85 and waist_to_hip_ratio > 0.85:
-                body_type = "apple"
-            
-            # Create response
-            results = [{
-                "measurements": measurements_dict,
-                "body_analysis": {
-                    "type": body_type,
-                    "confidence": "medium",
-                    "ratios": {
-                        "waist_to_bust": waist_to_bust_ratio,
-                        "waist_to_hip": waist_to_hip_ratio
-                    }
-                }
-            }]
-            
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in manual_measurements")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing measurements: {str(e)}")
-    
-    return {"results": results}
-
-# Recommend abaya endpoint
-@app.post("/recommend-abaya")
-async def recommend_abaya(request: dict):
     try:
-        body_type = request.get("body_type", "").lower()
-        
-        if body_type not in BODY_TYPE_RECOMMENDATIONS:
-            # If body type not found, return general recommendations
-            recommendations = [BODY_TYPE_RECOMMENDATIONS[bt][0] for bt in BODY_TYPE_RECOMMENDATIONS]
+        if image:
+            # تحليل الصورة
+            image_data = await image.read()
+            measurements = analyze_image_content(image_data, user_height_cm)
+            source = "image_analysis"
+        elif manual_measurements:
+            # تحليل القياسات اليدوية
+            measurements = json.loads(manual_measurements)
+            required = ["bust", "waist", "hips", "shoulder_width"]
+            if not all(k in measurements for k in required):
+                missing = [k for k in required if k not in measurements]
+                raise HTTPException(400, f"القياسات المطلوبة: {', '.join(missing)}")
+            source = "manual_input"
         else:
-            recommendations = BODY_TYPE_RECOMMENDATIONS[body_type]
+            raise HTTPException(400, "يجب تقديم صورة أو قياسات يدوية")
         
-        # Add placeholder base64 images (in a real implementation, you'd load actual images)
-        for rec in recommendations:
-            # In an actual implementation, you would load and encode real images
-            # This creates a tiny placeholder image
-            img = Image.new('RGB', (100, 150), color=(73, 109, 137))
-            buffered = io.BytesIO()
-            img.save(buffered, format="JPEG")
-            rec["image_base64"] = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        # تحديد نوع الجسم
+        body_type = determine_body_type(measurements)
         
-        return {"recommendations": recommendations}
+        # إعداد النتائج
+        response = {
+            "source": source,
+            "measurements": measurements,
+            "body_type": body_type,
+            "characteristics": get_body_characteristics(body_type),
+            "recommendations": BODY_TYPE_RECOMMENDATIONS.get(body_type, [])
+        }
         
+        return response
+        
+    except json.JSONDecodeError:
+        raise HTTPException(400, "تنسيق JSON غير صحيح للقياسات اليدوية")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting recommendations: {str(e)}")
+        raise HTTPException(500, f"خطأ في المعالجة: {str(e)}")
 
-# Run the API server
+def get_body_characteristics(body_type):
+    """وصف خصائص كل نوع جسم"""
+    characteristics = {
+        "hourglass": "تناسق بين الصدر والأوراك مع خصر محدد بوضوح",
+        "pear": "أوراك عريضة مقارنة بالكتفين مع خصر متوسط",
+        "inverted_triangle": "كتفان عريضان مقارنة بالأوراك مع خصر غير محدد",
+        "rectangle": "تناسق بين الكتفين والصدر والأوراك مع خصر غير واضح",
+        "apple": "منطقة وسطية عريضة مع صدر وأوراك متقاربة في العرض"
+    }
+    return characteristics.get(body_type, "")
+
+@app.get("/body-types-info")
+async def get_body_types_info():
+    """الحصول على معلومات عن جميع أنواع الأجسام"""
+    return {
+        "types": {
+            "hourglass": {"description": "الصدر والأوراك متساويان تقريباً مع خصر ضيق", "common": 20},
+            "pear": {"description": "الأوراك أوسع من الكتفين مع خصر متوسط", "common": 35},
+            "inverted_triangle": {"description": "الكتفان أوسع من الأوراك مع خصر غير محدد", "common": 15},
+            "rectangle": {"description": "القياسات متقاربة مع خصر غير واضح", "common": 25},
+            "apple": {"description": "المنطقة الوسطى هي الأوسع مع صدر وأوراك متقاربة", "common": 5}
+        }
+    }
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
